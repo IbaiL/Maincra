@@ -1,0 +1,359 @@
+// Dependencies needed for what our Gradle scripts themselves use. It cannot be included via an external Gradle file :-(
+buildscript {
+    repositories {
+        // External libs - jcenter is Bintray and is supposed to be a superset of Maven Central, but do both just in case
+        jcenter()
+        mavenCentral()
+        // gradle plugins
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
+    }
+
+    dependencies {
+        // Needed for caching reflected data during builds
+        classpath 'org.reflections:reflections:0.9.10'
+        classpath 'dom4j:dom4j:1.6.1'
+
+        //Spotbugs
+        classpath "gradle.plugin.com.github.spotbugs.snom:spotbugs-gradle-plugin:4.0.0"
+
+        // SonarQube / Cloud scanning
+        classpath "org.sonarsource.scanner.gradle:sonarqube-gradle-plugin:2.8"
+    }
+}
+
+// Customization of IDE options
+apply from: 'config/gradle/ide.gradle'
+
+// Needed for extending the "clean" task to also delete custom stuff defined here like natives
+apply plugin: 'base'
+
+// The root project should not be an eclipse project. It keeps eclipse (4.2) from finding the sub-projects.
+//apply plugin: 'eclipse'
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+
+// Test for right version of Java in use for running this script
+assert org.gradle.api.JavaVersion.current().isJava8Compatible()
+
+import org.gradle.internal.logging.text.StyledTextOutputFactory
+import static org.gradle.internal.logging.text.StyledTextOutput.Style
+
+// Check for Java 8
+if(JavaVersion.current() != JavaVersion.VERSION_1_8){
+    def out = services.get(StyledTextOutputFactory).create("an-ouput")
+    out.withStyle(Style.FailureHeader).println("WARNING: You're compiling with a JDK newer than Java 8, this may not be fully supported for Terasology, consider adjusting your JAVA_HOME accordingly")
+}
+
+// Declare "extra properties" (variables) for the project (and subs) - a Gradle thing that makes them special.
+ext {
+    dirNatives = 'natives'
+    dirConfigMetrics = 'config/metrics'
+    templatesDir = 'templates'
+
+    // Lib dir for use in manifest entries etc (like in :engine). A separate "libsDir" exists, auto-created by Gradle
+    subDirLibs = 'libs'
+
+    LwjglVersion = '2.9.3'
+}
+
+// Declare remote repositories we're interested in - library files will be fetched from here
+repositories {
+    // External libs - jcenter is Bintray and is supposed to be a superset of Maven Central, but do both just in case
+    jcenter()
+    mavenCentral()
+
+    // MovingBlocks Artifactory instance for libs not readily available elsewhere plus our own libs
+    maven {
+        url "http://artifactory.terasology.org/artifactory/virtual-repo-live"
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Natives - Handles pulling in and extracting native libraries for LWJGL                                            //
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Define configurations for natives and config
+configurations {
+    natives
+    codeMetrics
+}
+
+dependencies {
+    // For the "natives" configuration make it depend on the native files from LWJGL
+    natives group: 'org.lwjgl.lwjgl', name: 'lwjgl', version: LwjglVersion
+
+    // Config for our code analytics lives in a centralized repo: https://github.com/MovingBlocks/TeraConfig
+    codeMetrics group: 'org.terasology.config', name: 'codemetrics', version: '1.3.2', ext: 'zip'
+
+    // Natives for JNLua (Kallisti, KComputers)
+    natives group: 'org.terasology.jnlua', name: 'jnlua_natives', version: '0.1.0-SNAPSHOT', ext: 'zip'
+}
+
+task extractWindowsNatives(type: Copy) {
+    description = "Extracts the Windows natives from the downloaded zip"
+    from {
+        configurations.natives.collect { it.getName().contains('-natives-window') ? zipTree(it) : [] }
+    }
+    into("$dirNatives/windows")
+    exclude('META-INF/**')
+}
+
+task extractMacOSXNatives(type: Copy) {
+    description = "Extracts the OSX natives from the downloaded zip"
+    from {
+        configurations.natives.collect { it.getName().contains('-natives-osx') ? zipTree(it) : [] }
+    }
+    into("$dirNatives/macosx")
+    exclude('META-INF/**')
+}
+
+task extractLinuxNatives(type: Copy) {
+    description = "Extracts the Linux natives from the downloaded zip"
+    from {
+        configurations.natives.collect { it.getName().contains('-natives-linux') ? zipTree(it) : [] }
+    }
+    into("$dirNatives/linux")
+    exclude('META-INF/**')
+}
+
+task extractJNLuaNatives(type: Copy) {
+    description = "Extracts the JNLua natives from the downloaded zip"
+    from {
+        configurations.natives.collect { it.getName().contains('jnlua') ? zipTree(it) : [] }
+    }
+    into("$dirNatives")
+}
+
+task extractNatives {
+    description = "Extracts all the native lwjgl libraries from the downloaded zip"
+    dependsOn extractWindowsNatives
+    dependsOn extractLinuxNatives
+    dependsOn extractMacOSXNatives
+    dependsOn extractJNLuaNatives
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper tasks                                                                                                      //
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+task extractConfig(type: Copy) {
+    description = "Extracts our configuration files from the zip we fetched as a dependency"
+    from {
+        configurations.codeMetrics.collect {
+            zipTree(it)
+        }
+    }
+    into "$rootDir/$dirConfigMetrics"
+}
+
+// Helper that returns a list of all local Terasology module projects
+def terasologyModules() {
+    subprojects.findAll { it.parent.name == 'modules' }
+}
+
+// Helpers that do magic things after having dependencies attached below
+task moduleClasses
+task moduleJars
+
+// This magically makes everything work - without this the desired module projects returned have no tasks :-(
+gradle.projectsEvaluated {
+    // Note how "classes" may indirectly trigger "jar" for module dependencies of modules (module compile dependency)
+    moduleClasses.dependsOn(terasologyModules().classes)
+
+    // This makes it work for a full jar task
+    moduleJars.dependsOn(terasologyModules().jar)
+}
+
+// This is a TEMPORARY tweak to make "changing" dependencies always ('0') check for newer snapshots available
+// TODO: Remove this when versioning and promotion works fully, then we shouldn't care about snapshots normally anyway
+configurations.all {
+    resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+}
+
+// Include deletion of extracted natives in the global clean task. Without the doLast it runs on *every* execution ...
+clean.doLast {
+    new File(dirNatives).deleteDir()
+    new File(dirConfigMetrics).deleteDir()
+    println "Cleaned root - don't forget to re-extract stuff! 'gradlew extractNatives extractConfig' will do so, or 'gradlew idea' (or eclipse)"
+}
+
+task protobufCompileWindows(type: Exec) {
+    description = "Run 'Protobuf Compiler' (Windows)"
+    commandLine 'protobuf\\compiler\\protoc.exe', '--proto_path=engine\\src\\main\\protobuf', '--java_out', 'engine\\src\\main\\java', 'engine\\src\\main\\protobuf\\*'
+}
+
+task protobufCompileLinux(type: Exec) {
+    description = "Run 'Protobuf Compiler' (Linux)"
+    commandLine 'protobuf/compiler/protoc', '--proto_path=engine/src/main/protobuf', '--java_out', 'engine/src/main/java', "engine/src/main/protobuf/EntityData.proto", "engine/src/main/protobuf/NetMessage.proto"
+}
+
+
+
+// Magic for replace remote dependency on local project (source)
+// for Engine
+allprojects {
+    configurations.all {
+        resolutionStrategy.dependencySubstitution {
+            substitute module("org.terasology.engine:engine") because "we have sources!" with project(":engine")
+            substitute module("org.terasology.engine:engine-tests") because "we have sources!" with project(":engine-tests")
+        }
+    }
+}
+
+// Magic for replace remote dependency on local project (source)
+// For exists modules
+project(":modules").subprojects.forEach { proj ->
+    project(":modules").subprojects {
+        configurations.all {
+            resolutionStrategy.dependencySubstitution {
+                substitute module("org.terasology.modules:${proj.name}") because "we have sources!" with project(":modules:${proj.name}")
+            }
+        }
+    }
+}
+
+/**
+ * Gathering remote modules files from remoteRepo to 'modules' for autoloading in game-time (tasks server, game etc)
+ */
+class RemoteModuleGatherer implements DependencyResolutionListener {
+
+    private final Path modulesDir
+
+    RemoteModuleGatherer(Path  modulesDir) {
+        this.modulesDir = modulesDir
+    }
+
+    @Override
+    void beforeResolve(ResolvableDependencies dependencies) {
+        // nothing to do
+    }
+
+    @Override
+    void afterResolve(ResolvableDependencies dependencies) {
+        // We process only module dependencies
+        if (dependencies.path.startsWith(":modules:") &&
+                dependencies.name == "compileClasspath") {
+            def projectName = dependencies.path.split(":")[2]
+
+            if (!dependencies.artifacts.artifacts.empty) {
+                println "\nProcessing module '$projectName' in a multi-project workspace"
+            }
+
+            dependencies.artifacts.artifacts.each {
+                if (isRemoteTerasologyModule(it)) {
+                    println "$projectName resolved binary $it"
+                    def binaryModulePath = modulesDir.resolve(it.file.name)
+                    Files.copy(it.file.toPath(), binaryModulePath, StandardCopyOption.REPLACE_EXISTING)
+                } else if (isLocalTerasologyModule(it)) {
+                    println "*** Found module dependency $it in source form, not copying a runtime jar from Gradle"
+                } else {
+                    //ignore non terasology module
+                }
+            }
+        }
+    }
+
+    private static boolean isRemoteTerasologyModule(ResolvedArtifactResult artifact) {
+        def componentIdentifier = artifact.id.componentIdentifier
+        if (componentIdentifier instanceof ModuleComponentIdentifier) {
+            def module = componentIdentifier as ModuleComponentIdentifier
+            return module.group == 'org.terasology.modules'
+        }
+        return false
+    }
+
+    private static boolean isLocalTerasologyModule(ResolvedArtifactResult artifact) {
+        def componentIdentifier = artifact.id.componentIdentifier
+        if (componentIdentifier instanceof ProjectComponentIdentifier) {
+            def module = componentIdentifier as ProjectComponentIdentifier
+            return !(module.projectName in ['engine', 'engine-tests'])
+        }
+        return false
+    }
+}
+
+gradle.addListener(new RemoteModuleGatherer(rootDir.toPath().resolve("modules")))
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// General IDE customization                                                                                         //
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+task copyInMissingTemplates {
+    description = "Copies in placeholders from the /templates dir to project root if not present yet"
+    File gradlePropsFile = new File(rootDir, 'gradle.properties')
+    File OverrideCfgFile = new File(rootDir, 'override.cfg')
+    if (!gradlePropsFile.exists()) {
+        new File(rootDir, 'gradle.properties') << new File(templatesDir, 'gradle.properties').text
+    }
+    if (!OverrideCfgFile.exists()) {
+        new File(rootDir, 'override.cfg') << new File(templatesDir, 'override.cfg').text
+    }
+}
+
+// Make sure the IDE prep includes extraction of natives
+ideaModule.dependsOn extractNatives
+ideaModule.dependsOn copyInMissingTemplates
+
+// For IntelliJ add a bunch of excluded directories
+idea {
+
+    // Exclude Eclipse dirs
+    // TODO: Update this as Eclipse bin dirs now generate in several deeper spots rather than at top-level
+    module.excludeDirs += file('bin')
+    module.excludeDirs += file('.settings')
+    // TODO: Add a single file exclude for facades/PC/Terasology.launch ?
+
+    // Exclude special dirs
+    module.excludeDirs += file('natives')
+    module.excludeDirs += file('protobuf')
+
+    // Exclude output dirs
+    module.excludeDirs += file('configs')
+    module.excludeDirs += file('logs')
+    module.excludeDirs += file('saves')
+    module.excludeDirs += file('screenshots')
+    module.excludeDirs += file('terasology-server')
+    module.excludeDirs += file('terasology-2ndclient')
+
+    module.downloadSources = true
+
+    project {
+        // Set JDK
+        jdkName = '1.8'
+        wildcards -= '!?*.groovy'
+
+        ipr {
+            withXml { xmlProvider ->
+                // Apply a bunch of tweaks to IntelliJ config - all defined in ide.gradle
+                // Part reason for separate file was in case a module needs to define something it cannot do so in a project block
+                def iprNode = xmlProvider.asNode()
+                ideaActivateCheckstyle(iprNode)
+                ideaActivateCopyright(iprNode)
+                ideaActivateAnnotations(iprNode)
+                ideaActivateGit(iprNode)
+                ideaActivateGradle(iprNode)
+            }
+
+            // Sets sourceCompatibility within IntelliJ (without this root build having the Java plugin applied)
+            whenMerged { project ->
+                project.jdk.languageLevel = 'JDK_1_8'
+            }
+        }
+    }
+
+    // Tweaks to the .iws
+    workspace.iws.withXml { xmlProvider ->
+        def iwsNode = xmlProvider.asNode()
+        ideaMakeAutomatically(iwsNode)
+        ideaRunConfig(iwsNode)
+    }
+}
+
+cleanIdea.doLast {
+    new File('Terasology.iws').delete()
+}
